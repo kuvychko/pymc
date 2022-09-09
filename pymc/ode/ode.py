@@ -34,6 +34,9 @@ class DifferentialEquation(Op):
     r"""
     Specify an ordinary differential equation
 
+    Due to the nature of the model (as well as included solvers), the process of ODE solution may perform slowly.  A faster alternative library based on PyMC--sunode--has implemented Adams' method and BDF (backward differentation formula).  More information about sunode is available at: https://github.com/aseyboldt/sunode.
+
+
     .. math::
         \dfrac{dy}{dt} = f(y,t,p) \quad y(t_0) = y_0
 
@@ -64,6 +67,7 @@ class DifferentialEquation(Op):
         times = np.arange(0.5, 5, 0.5)
 
         ode_model = DifferentialEquation(func=odefunc, times=times, n_states=1, n_theta=1, t0=0)
+
     """
     _itypes = [
         TensorType(floatX, (False,)),  # y0 as 1D floatX vector
@@ -154,11 +158,11 @@ class DifferentialEquation(Op):
             )
 
         # convert inputs to tensors (and check their types)
-        y0 = at.cast(at.unbroadcast(at.as_tensor_variable(y0), 0), floatX)
-        theta = at.cast(at.unbroadcast(at.as_tensor_variable(theta), 0), floatX)
+        y0 = at.cast(at.as_tensor_variable(y0), floatX)
+        theta = at.cast(at.as_tensor_variable(theta), floatX)
         inputs = [y0, theta]
         for i, (input_val, itype) in enumerate(zip(inputs, self._itypes)):
-            if not input_val.type.in_same_class(itype):
+            if not itype.is_super(input_val.type):
                 raise ValueError(
                     f"Input {i} of type {input_val.type} does not have the expected type of {itype}"
                 )

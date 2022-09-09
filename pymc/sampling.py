@@ -45,7 +45,6 @@ import xarray
 from aesara import tensor as at
 from aesara.graph.basic import Apply, Constant, Variable, general_toposort, walk
 from aesara.graph.fg import FunctionGraph
-from aesara.tensor.random.op import RandomVariable
 from aesara.tensor.random.var import (
     RandomGeneratorSharedVariable,
     RandomStateSharedVariable,
@@ -474,7 +473,14 @@ def sample(
         )
         initvals = kwargs.pop("start")
     if "target_accept" in kwargs:
-        kwargs.setdefault("nuts", {"target_accept": kwargs.pop("target_accept")})
+        if "nuts" in kwargs and "target_accept" in kwargs["nuts"]:
+            raise ValueError(
+                "`target_accept` was defined twice. Please specify it either as a direct keyword argument or in the `nuts` kwarg."
+            )
+        if "nuts" in kwargs:
+            kwargs["nuts"]["target_accept"] = kwargs.pop("target_accept")
+        else:
+            kwargs = {"nuts": {"target_accept": kwargs.pop("target_accept")}}
 
     model = modelcontext(model)
     if not model.free_RVs:
@@ -1694,10 +1700,7 @@ def compile_forward_sampling_function(
                 and not isinstance(node, (RandomStateSharedVariable, RandomGeneratorSharedVariable))
             )
             or (  # Basic RVs that are not in the trace
-                node.owner
-                and isinstance(node.owner.op, RandomVariable)
-                and node in basic_rvs
-                and node not in vars_in_trace
+                node in basic_rvs and node not in vars_in_trace
             )
             or (  # Variables that have any volatile input
                 node.owner and any(inp in volatile_nodes for inp in node.owner.inputs)

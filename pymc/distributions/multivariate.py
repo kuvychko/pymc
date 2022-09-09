@@ -24,6 +24,7 @@ import aesara.tensor as at
 import numpy as np
 import scipy
 
+from aeppl.logprob import _logprob
 from aesara.graph.basic import Apply, Constant, Variable
 from aesara.graph.op import Op
 from aesara.raise_op import Assert
@@ -32,23 +33,16 @@ from aesara.tensor import gammaln, sigmoid
 from aesara.tensor.nlinalg import det, eigh, matrix_inverse, trace
 from aesara.tensor.random.basic import dirichlet, multinomial, multivariate_normal
 from aesara.tensor.random.op import RandomVariable, default_supp_shape_from_params
-from aesara.tensor.random.utils import broadcast_params, normalize_size_param
-from aesara.tensor.slinalg import Cholesky
-from aesara.tensor.slinalg import solve_lower_triangular as solve_lower
-from aesara.tensor.slinalg import solve_upper_triangular as solve_upper
+from aesara.tensor.random.utils import broadcast_params
+from aesara.tensor.slinalg import Cholesky, SolveTriangular
 from aesara.tensor.type import TensorType
 from scipy import linalg, stats
 
 import pymc as pm
 
-from pymc.aesaraf import change_rv_size, floatX, intX
+from pymc.aesaraf import floatX, intX
 from pymc.distributions import transforms
-from pymc.distributions.continuous import (
-    BoundedContinuous,
-    ChiSquared,
-    Normal,
-    assert_negative_support,
-)
+from pymc.distributions.continuous import BoundedContinuous, ChiSquared, Normal
 from pymc.distributions.dist_math import (
     betaln,
     check_parameters,
@@ -56,10 +50,19 @@ from pymc.distributions.dist_math import (
     logpow,
     multigammaln,
 )
-from pymc.distributions.distribution import Continuous, Discrete, moment
+from pymc.distributions.distribution import (
+    Continuous,
+    Discrete,
+    Distribution,
+    SymbolicRandomVariable,
+    _moment,
+    moment,
+)
 from pymc.distributions.logprob import ignore_logprob
 from pymc.distributions.shape_utils import (
+    _change_dist_size,
     broadcast_dist_samples_to,
+    change_dist_size,
     rv_size_is_none,
     to_tuple,
 )
@@ -83,6 +86,9 @@ __all__ = [
     "CAR",
     "StickBreakingWeights",
 ]
+
+solve_lower = SolveTriangular(lower=True)
+solve_upper = SolveTriangular(lower=False)
 
 
 class SimplexContinuous(Continuous):
@@ -199,13 +205,13 @@ class MvNormal(Continuous):
 
     Parameters
     ----------
-    mu: array
+    mu : tensor_like of float
         Vector of means.
-    cov: array
+    cov : tensor_like of float, optional
         Covariance matrix. Exactly one of cov, tau, or chol is needed.
-    tau: array
+    tau : tensor_like of float, optional
         Precision matrix. Exactly one of cov, tau, or chol is needed.
-    chol: array
+    chol : tensor_like of float, optional
         Cholesky decomposition of covariance matrix. Exactly one of cov,
         tau, or chol is needed.
     lower: bool, default=True
@@ -353,45 +359,52 @@ class MvStudentT(Continuous):
 
     Parameters
     ----------
-    nu: float
+    nu : tensor_like of float
         Degrees of freedom, should be a positive scalar.
-    Sigma: matrix
-        Covariance matrix. Use `cov` in new code.
-    mu: array
+    Sigma : tensor_like of float, optional
+        Scale matrix. Use `scale` in new code.
+    mu : tensor_like of float, optional
         Vector of means.
-    cov: matrix
-        The covariance matrix.
-    tau: matrix
+    scale : tensor_like of float, optional
+        The scale matrix.
+    tau : tensor_like of float, optional
         The precision matrix.
-    chol: matrix
-        The cholesky factor of the covariance matrix.
-    lower: bool, default=True
+    chol : tensor_like of float, optional
+        The cholesky factor of the scale matrix.
+    lower : bool, default=True
         Whether the cholesky fatcor is given as a lower triangular matrix.
     """
     rv_op = mv_studentt
 
     @classmethod
-    def dist(cls, nu, Sigma=None, mu=None, cov=None, tau=None, chol=None, lower=True, **kwargs):
+    def dist(cls, nu, Sigma=None, mu=None, scale=None, tau=None, chol=None, lower=True, **kwargs):
+        if kwargs.get("cov") is not None:
+            warnings.warn(
+                "Use the scale argument to specify the scale matrix."
+                "cov will be removed in future versions.",
+                FutureWarning,
+            )
+            scale = kwargs.pop("cov")
         if Sigma is not None:
-            if cov is not None:
-                raise ValueError("Specify only one of cov and Sigma")
-            cov = Sigma
+            if scale is not None:
+                raise ValueError("Specify only one of scale and Sigma")
+            scale = Sigma
         nu = at.as_tensor_variable(floatX(nu))
         mu = at.as_tensor_variable(floatX(mu))
-        cov = quaddist_matrix(cov, chol, tau, lower)
+        scale = quaddist_matrix(scale, chol, tau, lower)
         # Aesara is stricter about the shape of mu, than PyMC used to be
-        mu = at.broadcast_arrays(mu, cov[..., -1])[0]
-        assert_negative_support(nu, "nu", "MvStudentT")
-        return super().dist([nu, mu, cov], **kwargs)
+        mu = at.broadcast_arrays(mu, scale[..., -1])[0]
 
-    def moment(rv, size, nu, mu, cov):
+        return super().dist([nu, mu, scale], **kwargs)
+
+    def moment(rv, size, nu, mu, scale):
         moment = mu
         if not rv_size_is_none(size):
             moment_size = at.concatenate([size, [mu.shape[-1]]])
             moment = at.full(moment_size, moment)
         return moment
 
-    def logp(value, nu, mu, cov):
+    def logp(value, nu, mu, scale):
         """
         Calculate log-probability of Multivariate Student's T distribution
         at specified value.
@@ -405,7 +418,7 @@ class MvStudentT(Continuous):
         -------
         TensorVariable
         """
-        quaddist, logdet, ok = quaddist_parse(value, mu, cov)
+        quaddist, logdet, ok = quaddist_parse(value, mu, scale)
         k = floatX(value.shape[-1])
 
         norm = gammaln((nu + k) / 2.0) - gammaln(nu / 2.0) - 0.5 * k * at.log(nu * np.pi)
@@ -439,7 +452,7 @@ class Dirichlet(SimplexContinuous):
 
     Parameters
     ----------
-    a: float array
+    a : tensor_like of float
         Concentration parameters (a > 0). The number of categories is given by the
         length of the last axis.
     """
@@ -515,12 +528,12 @@ class Multinomial(Discrete):
 
     Parameters
     ----------
-    n: int
+    n : tensor_like of int
         Total counts in each replicate (n > 0).
-    p: float array
+    p : tensor_like of float
         Probability of each one of the different outcomes (0 <= p <= 1). The number of
         categories is given by the length of the last axis. Elements are expected to sum
-        to 1 along the last axis, and they will be automatically rescaled otherwise.
+        to 1 along the last axis.
     """
     rv_op = multinomial
 
@@ -544,7 +557,7 @@ class Multinomial(Discrete):
         n = at.shape_padright(n)
         mode = at.round(n * p)
         diff = n - at.sum(mode, axis=-1, keepdims=True)
-        inc_bool_arr = at.abs_(diff) > 0
+        inc_bool_arr = at.abs(diff) > 0
         mode = at.inc_subtensor(mode[inc_bool_arr.nonzero()], diff[inc_bool_arr.nonzero()])
         if not rv_size_is_none(size):
             output_size = at.concatenate([size, [p.shape[-1]]])
@@ -644,10 +657,10 @@ class DirichletMultinomial(Discrete):
 
     Parameters
     ----------
-    n : int
+    n : tensor_like of int
         Total counts in each replicate (n > 0).
 
-    a : float array
+    a : tensor_like of float
         Dirichlet concentration parameters (a > 0). The number of categories is given by
         the length of the last axis.
     """
@@ -757,15 +770,15 @@ class OrderedMultinomial:
 
     Parameters
     ----------
-    eta: float
+    eta : tensor_like of float
         The predictor.
-    cutpoints: array
+    cutpoints : tensor_like of float
         The length K - 1 array of cutpoints which break :math:`\eta` into
         ranges. Do not explicitly set the first and last elements of
         :math:`c` to negative and positive infinity.
-    n: int
+    n : tensor_like of int
         The total number of multinomial trials.
-    compute_p: boolean, default True
+    compute_p : boolean, default=True
         Whether to compute and store in the trace the inferred probabilities of each
         categories,
         based on the cutpoints' values. Defaults to True.
@@ -838,7 +851,7 @@ class PosDefMatrix(Op):
     def make_node(self, x):
         x = at.as_tensor_variable(x)
         assert x.ndim == 2
-        o = TensorType(dtype="int8", broadcastable=[])()
+        o = TensorType(dtype="int8", shape=[])()
         return Apply(self, [x], [o])
 
     # Python implementation:
@@ -880,7 +893,7 @@ class WishartRV(RandomVariable):
     @classmethod
     def rng_fn(cls, rng, nu, V, size):
         scipy_size = size if size else 1  # Default size for Scipy's wishart.rvs is 1
-        result = stats.wishart.rvs(np.int(nu), V, size=scipy_size, random_state=rng)
+        result = stats.wishart.rvs(int(nu), V, size=scipy_size, random_state=rng)
         if size == (1,):
             return result[np.newaxis, ...]
         else:
@@ -916,9 +929,9 @@ class Wishart(Continuous):
 
     Parameters
     ----------
-    nu: int
+    nu : tensor_like of int
         Degrees of freedom, > 0.
-    V: array
+    V : tensor_like of float
         p x p positive definite matrix.
 
     Notes
@@ -1007,18 +1020,18 @@ def WishartBartlett(name, S, nu, is_cholesky=False, return_cholesky=False, initv
 
     Parameters
     ----------
-    S: ndarray
+    S : ndarray
         p x p positive definite matrix
         Or:
         p x p lower-triangular matrix that is the Cholesky factor
         of the covariance matrix.
-    nu: int
+    nu : tensor_like of int
         Degrees of freedom, > dim(S).
-    is_cholesky: bool (default=False)
+    is_cholesky : bool, default=False
         Input matrix S is already Cholesky decomposed as S.T * S
-    return_cholesky: bool (default=False)
+    return_cholesky : bool, default=False
         Only return the Cholesky decomposed matrix.
-    initval: ndarray
+    initval : ndarray
         p x p positive definite matrix used to initialize
 
     Notes
@@ -1093,12 +1106,12 @@ def _lkj_normalizing_constant(eta, n):
     return result
 
 
-class _LKJCholeskyCovRV(RandomVariable):
-    name = "_lkjcholeskycov"
+class _LKJCholeskyCovBaseRV(RandomVariable):
+    name = "_lkjcholeskycovbase"
     ndim_supp = 1
     ndims_params = [0, 0, 1]
     dtype = "floatX"
-    _print_name = ("_lkjcholeskycov", "\\operatorname{_lkjcholeskycov}")
+    _print_name = ("_lkjcholeskycovbase", "\\operatorname{_lkjcholeskycovbase}")
 
     def make_node(self, rng, size, dtype, n, eta, D):
         n = at.as_tensor_variable(n)
@@ -1111,35 +1124,19 @@ class _LKJCholeskyCovRV(RandomVariable):
 
         D = at.as_tensor_variable(D)
 
-        # We resize the sd_dist `D` automatically so that it has (size x n) independent
-        # draws which is what the `_LKJCholeskyCovRV.rng_fn` expects. This makes the
-        # random and logp methods equivalent, as the latter also assumes a unique value
-        # for each diagonal element.
-        # Since `eta` and `n` are forced to be scalars we don't need to worry about
-        # implied batched dimensions for the time being.
-        size = normalize_size_param(size)
-        if D.owner.op.ndim_supp == 0:
-            D = change_rv_size(D, at.concatenate((size, (n,))))
-        else:
-            # The support shape must be `n` but we have no way of controlling it
-            D = change_rv_size(D, size)
-
         return super().make_node(rng, size, dtype, n, eta, D)
 
-    def _infer_shape(self, size, dist_params, param_shapes=None):
+    def _supp_shape_from_params(self, dist_params, param_shapes):
         n = dist_params[0]
-        dist_shape = tuple(size) + ((n * (n + 1)) // 2,)
-        return dist_shape
+        return ((n * (n + 1)) // 2,)
 
     def rng_fn(self, rng, n, eta, D, size):
         # We flatten the size to make operations easier, and then rebuild it
         if size is None:
-            flat_size = 1
-        else:
-            flat_size = np.prod(size)
+            size = D.shape[:-1]
+        flat_size = np.prod(size).astype(int)
 
-        C = LKJCorrRV._random_corr_matrix(rng, n, eta, flat_size)
-
+        C = LKJCorrRV._random_corr_matrix(rng=rng, n=n, eta=eta, flat_size=flat_size)
         D = D.reshape(flat_size, n)
         C *= D[..., :, np.newaxis] * D[..., np.newaxis, :]
 
@@ -1155,101 +1152,138 @@ class _LKJCholeskyCovRV(RandomVariable):
         return samples
 
 
-_ljk_cholesky_cov = _LKJCholeskyCovRV()
+_ljk_cholesky_cov_base = _LKJCholeskyCovBaseRV()
 
 
-class _LKJCholeskyCov(Continuous):
+# _LKJCholeskyCovBaseRV requires a properly shaped `D`, which means the variable can't
+# be safely resized. Because of this, we add the thin SymbolicRandomVariable wrapper
+class _LKJCholeskyCovRV(SymbolicRandomVariable):
+    default_output = 1
+    _print_name = ("_lkjcholeskycov", "\\operatorname{_lkjcholeskycov}")
+
+    def update(self, node):
+        return {node.inputs[0]: node.outputs[0]}
+
+
+class _LKJCholeskyCov(Distribution):
     r"""Underlying class for covariance matrix with LKJ distributed correlations.
     See docs for LKJCholeskyCov function for more details on how to use it in models.
     """
-    rv_op = _ljk_cholesky_cov
 
-    def __new__(cls, name, eta, n, sd_dist, **kwargs):
-        check_dist_not_registered(sd_dist)
-        return super().__new__(cls, name, eta, n, sd_dist, **kwargs)
+    rv_type = _LKJCholeskyCovRV
 
     @classmethod
-    def dist(cls, eta, n, sd_dist, **kwargs):
-        eta = at.as_tensor_variable(floatX(eta))
+    def dist(cls, n, eta, sd_dist, **kwargs):
         n = at.as_tensor_variable(intX(n))
+        eta = at.as_tensor_variable(floatX(eta))
 
         if not (
             isinstance(sd_dist, Variable)
             and sd_dist.owner is not None
-            and isinstance(sd_dist.owner.op, RandomVariable)
+            and isinstance(sd_dist.owner.op, (RandomVariable, SymbolicRandomVariable))
             and sd_dist.owner.op.ndim_supp < 2
         ):
             raise TypeError("sd_dist must be a scalar or vector distribution variable")
 
+        check_dist_not_registered(sd_dist)
         # sd_dist is part of the generative graph, but should be completely ignored
         # by the logp graph, since the LKJ logp explicitly includes these terms.
-        # TODO: Things could be simplified a bit if we managed to extract the
-        #  sd_dist prior components from the logp expression.
         sd_dist = ignore_logprob(sd_dist)
-
         return super().dist([n, eta, sd_dist], **kwargs)
 
-    def moment(rv, size, n, eta, sd_dists):
-        diag_idxs = (at.cumsum(at.arange(1, n + 1)) - 1).astype("int32")
-        moment = at.zeros_like(rv)
-        moment = at.set_subtensor(moment[..., diag_idxs], 1)
-        return moment
+    @classmethod
+    def rv_op(cls, n, eta, sd_dist, size=None):
+        # We resize the sd_dist automatically so that it has (size x n) independent
+        # draws which is what the `_LKJCholeskyCovBaseRV.rng_fn` expects. This makes the
+        # random and logp methods equivalent, as the latter also assumes a unique value
+        # for each diagonal element.
+        # Since `eta` and `n` are forced to be scalars we don't need to worry about
+        # implied batched dimensions from those for the time being.
+        if size is None:
+            size = sd_dist.shape[:-1]
+        shape = tuple(size) + (n,)
+        if sd_dist.owner.op.ndim_supp == 0:
+            sd_dist = change_dist_size(sd_dist, shape)
+        else:
+            # The support shape must be `n` but we have no way of controlling it
+            sd_dist = change_dist_size(sd_dist, shape[:-1])
 
-    def logp(value, n, eta, sd_dist):
-        """
-        Calculate log-probability of Covariance matrix with LKJ
-        distributed correlations at specified value.
+        # Create new rng for the _lkjcholeskycov internal RV
+        rng = aesara.shared(np.random.default_rng())
 
-        Parameters
-        ----------
-        value: numeric
-            Value for which log-probability is calculated.
+        rng_, n_, eta_, sd_dist_ = rng.type(), n.type(), eta.type(), sd_dist.type()
+        next_rng_, lkjcov_ = _ljk_cholesky_cov_base(n_, eta_, sd_dist_, rng=rng_).owner.outputs
 
-        Returns
-        -------
-        TensorVariable
-        """
-
-        if value.ndim > 1:
-            raise ValueError("LKJCholeskyCov logp is only implemented for vector values (ndim=1)")
-
-        diag_idxs = at.cumsum(at.arange(1, n + 1)) - 1
-        cumsum = at.cumsum(value**2)
-        variance = at.zeros(at.atleast_1d(n))
-        variance = at.inc_subtensor(variance[0], value[0] ** 2)
-        variance = at.inc_subtensor(variance[1:], cumsum[diag_idxs[1:]] - cumsum[diag_idxs[:-1]])
-        sd_vals = at.sqrt(variance)
-
-        logp_sd = pm.logp(sd_dist, sd_vals).sum()
-        corr_diag = value[diag_idxs] / sd_vals
-
-        logp_lkj = (2 * eta - 3 + n - at.arange(n)) * at.log(corr_diag)
-        logp_lkj = at.sum(logp_lkj)
-
-        # Compute the log det jacobian of the second transformation
-        # described in the docstring.
-        idx = at.arange(n)
-        det_invjac = at.log(corr_diag) - idx * at.log(sd_vals)
-        det_invjac = det_invjac.sum()
-
-        # TODO: _lkj_normalizing_constant currently requires `eta` and `n` to be constants
-        if not isinstance(n, Constant):
-            raise NotImplementedError("logp only implemented for constant `n`")
-        n = int(n.data)
-
-        if not isinstance(eta, Constant):
-            raise NotImplementedError("logp only implemented for constant `eta`")
-        eta = float(eta.data)
-
-        norm = _lkj_normalizing_constant(eta, n)
-
-        return norm + logp_lkj + logp_sd + det_invjac
+        return _LKJCholeskyCovRV(
+            inputs=[rng_, n_, eta_, sd_dist_],
+            outputs=[next_rng_, lkjcov_],
+            ndim_supp=1,
+        )(rng, n, eta, sd_dist)
 
 
-@_default_transform.register(_LKJCholeskyCov)
-def lkjcholeskycov_default_transform(op, rv):
-    _, _, _, n, _, _ = rv.owner.inputs
+@_change_dist_size.register(_LKJCholeskyCovRV)
+def change_LKJCholeksyCovRV_size(op, dist, new_size, expand=False):
+    n, eta, sd_dist = dist.owner.inputs[1:]
+
+    if expand:
+        old_size = sd_dist.shape[:-1]
+        new_size = tuple(new_size) + tuple(old_size)
+
+    return _LKJCholeskyCov.rv_op(n, eta, sd_dist, size=new_size)
+
+
+@_moment.register(_LKJCholeskyCovRV)
+def _LKJCholeksyCovRV_moment(op, rv, rng, n, eta, sd_dist):
+    diag_idxs = (at.cumsum(at.arange(1, n + 1)) - 1).astype("int32")
+    moment = at.zeros_like(rv)
+    moment = at.set_subtensor(moment[..., diag_idxs], 1)
+    return moment
+
+
+@_default_transform.register(_LKJCholeskyCovRV)
+def _LKJCholeksyCovRV_default_transform(op, rv):
+    _, n, _, _ = rv.owner.inputs
     return transforms.CholeskyCovPacked(n)
+
+
+@_logprob.register(_LKJCholeskyCovRV)
+def _LKJCholeksyCovRV_logp(op, values, rng, n, eta, sd_dist, **kwargs):
+    (value,) = values
+
+    if value.ndim > 1:
+        raise ValueError("_LKJCholeskyCov logp is only implemented for vector values (ndim=1)")
+
+    diag_idxs = at.cumsum(at.arange(1, n + 1)) - 1
+    cumsum = at.cumsum(value**2)
+    variance = at.zeros(at.atleast_1d(n))
+    variance = at.inc_subtensor(variance[0], value[0] ** 2)
+    variance = at.inc_subtensor(variance[1:], cumsum[diag_idxs[1:]] - cumsum[diag_idxs[:-1]])
+    sd_vals = at.sqrt(variance)
+
+    logp_sd = pm.logp(sd_dist, sd_vals).sum()
+    corr_diag = value[diag_idxs] / sd_vals
+
+    logp_lkj = (2 * eta - 3 + n - at.arange(n)) * at.log(corr_diag)
+    logp_lkj = at.sum(logp_lkj)
+
+    # Compute the log det jacobian of the second transformation
+    # described in the docstring.
+    idx = at.arange(n)
+    det_invjac = at.log(corr_diag) - idx * at.log(sd_vals)
+    det_invjac = det_invjac.sum()
+
+    # TODO: _lkj_normalizing_constant currently requires `eta` and `n` to be constants
+    if not isinstance(n, Constant):
+        raise NotImplementedError("logp only implemented for constant `n`")
+    n = int(n.data)
+
+    if not isinstance(eta, Constant):
+        raise NotImplementedError("logp only implemented for constant `eta`")
+    eta = float(eta.data)
+
+    norm = _lkj_normalizing_constant(eta, n)
+
+    return norm + logp_lkj + logp_sd + det_invjac
 
 
 class LKJCholeskyCov:
@@ -1262,27 +1296,27 @@ class LKJCholeskyCov:
 
     Parameters
     ----------
-    name: str
+    name : str
         The name given to the variable in the model.
-    eta: float
+    eta : tensor_like of float
         The shape parameter (eta > 0) of the LKJ distribution. eta = 1
         implies a uniform distribution of the correlation matrices;
         larger values put more weight on matrices with few correlations.
-    n: int
+    n : tensor_like of int
         Dimension of the covariance matrix (n > 1).
-    sd_dist: unnamed distribution
+    sd_dist : Distribution
         A positive scalar or vector distribution for the standard deviations, created
         with the `.dist()` API. Should have `shape[-1]=n`. Scalar distributions will be
         automatically resized to ensure this.
 
         .. warning:: sd_dist will be cloned, rendering it independent of the one passed as input.
 
-    compute_corr: bool, default=True
+    compute_corr : bool, default=True
         If `True`, returns three values: the Cholesky decomposition, the correlations
         and the standard deviations of the covariance matrix. Otherwise, only returns
         the packed Cholesky decomposition. Defaults to `True`.
         compatibility.
-    store_in_trace: bool, default=True
+    store_in_trace : bool, default=True
         Whether to store the correlations and standard deviations of the covariance
         matrix in the posterior trace. If `True`, they will automatically be named as
         `{name}_corr` and `{name}_stds` respectively. Effective only when
@@ -1290,13 +1324,13 @@ class LKJCholeskyCov:
 
     Returns
     -------
-    chol:  TensorVariable
+    chol :  TensorVariable
         If `compute_corr=True`. The unpacked Cholesky covariance decomposition.
-    corr: TensorVariable
+    corr : TensorVariable
         If `compute_corr=True`. The correlations of the covariance matrix.
-    stds: TensorVariable
+    stds : TensorVariable
         If `compute_corr=True`. The standard deviations of the covariance matrix.
-    packed_chol: TensorVariable
+    packed_chol : TensorVariable
         If `compute_corr=False` The packed Cholesky covariance decomposition.
 
     Notes
@@ -1458,7 +1492,7 @@ class LKJCorrRV(RandomVariable):
         else:
             flat_size = np.prod(size)
 
-        C = cls._random_corr_matrix(rng, n, eta, flat_size)
+        C = cls._random_corr_matrix(rng=rng, n=n, eta=eta, flat_size=flat_size)
 
         triu_idx = np.triu_indices(n, k=1)
         samples = C[..., triu_idx[0], triu_idx[1]]
@@ -1507,9 +1541,9 @@ class LKJCorr(BoundedContinuous):
 
     Parameters
     ----------
-    n: int
+    n : tensor_like of int
         Dimension of the covariance matrix (n > 1).
-    eta: float
+    eta : tensor_like of float
         The shape parameter (eta > 0) of the LKJ distribution. eta = 1
         implies a uniform distribution of the correlation matrices;
         larger values put more weight on matrices with few correlations.
@@ -1649,20 +1683,20 @@ class MatrixNormal(Continuous):
 
     Parameters
     ----------
-    mu: array
+    mu : tensor_like of float
         Array of means. Must be broadcastable with the random variable X such
-        that the shape of mu + X is (m,n).
-    rowcov: mxm array
+        that the shape of mu + X is (M, N).
+    rowcov : (M, M) tensor_like of float, optional
         Among-row covariance matrix. Defines variance within
         columns. Exactly one of rowcov or rowchol is needed.
-    rowchol: mxm array
+    rowchol : (M, M) tensor_like of float, optional
         Cholesky decomposition of among-row covariance matrix. Exactly one of
         rowcov or rowchol is needed.
-    colcov: nxn array
+    colcov : (N, N) tensor_like of float, optional
         Among-column covariance matrix. If rowcov is the identity matrix,
         this functions as `cov` in MvNormal.
         Exactly one of colcov or colchol is needed.
-    colchol: nxn array
+    colchol : (N, N) tensor_like of float, optional
         Cholesky decomposition of among-column covariance matrix. Exactly one
         of colcov or colchol is needed.
 
@@ -1850,27 +1884,26 @@ class KroneckerNormal(Continuous):
     ========  ==========================
     Support   :math:`x \in \mathbb{R}^N`
     Mean      :math:`\mu`
-    Variance  :math:`K = \bigotimes K_i` + \sigma^2 I_N
+    Variance  :math:`K = \bigotimes K_i + \sigma^2 I_N`
     ========  ==========================
 
     Parameters
     ----------
-    mu: array
+    mu : tensor_like of float
         Vector of means, just as in `MvNormal`.
-    covs: list of arrays
+    covs : list of arrays
         The set of covariance matrices :math:`[K_1, K_2, ...]` to be
         Kroneckered in the order provided :math:`\bigotimes K_i`.
-    chols: list of arrays
+    chols : list of arrays
         The set of lower cholesky matrices :math:`[L_1, L_2, ...]` such that
         :math:`K_i = L_i L_i'`.
-    evds: list of tuples
+    evds : list of tuples
         The set of eigenvalue-vector, eigenvector-matrix pairs
         :math:`[(v_1, Q_1), (v_2, Q_2), ...]` such that
         :math:`K_i = Q_i \text{diag}(v_i) Q_i'`. For example::
 
             v_i, Q_i = at.nlinalg.eigh(K_i)
-
-    sigma: scalar, variable
+    sigma : scalar, optional
         Standard deviation of the Gaussian white noise.
 
     Examples
@@ -2102,19 +2135,20 @@ class CAR(Continuous):
 
     Parameters
     ----------
-    mu: array
+    mu : tensor_like of float
         Real-valued mean vector
-    W: Numpy matrix
+    W : (M, M) tensor_like of int
         Symmetric adjacency matrix of 1s and 0s indicating
-        adjacency between elements.
-    alpha: float or array
+        adjacency between elements. If possible, *W* is converted
+        to a sparse matrix, falling back to a dense variable.
+        :func:`~aesara.sparse.basic.as_sparse_or_tensor_variable` is
+        used for this sparse or tensorvariable conversion.
+    alpha : tensor_like of float
         Autoregression parameter taking values between -1 and 1. Values closer to 0 indicate weaker
         correlation and values closer to 1 indicate higher autocorrelation. For most use cases, the
-        support of alpha should be restricted to (0, 1)
-    tau: float or array
+        support of alpha should be restricted to (0, 1).
+    tau : tensor_like of float
         Positive precision variable controlling the scale of the underlying normal variates.
-    sparse: bool, default=False
-        Determines whether or not sparse computations are used
 
     References
     ----------
@@ -2197,32 +2231,23 @@ class StickBreakingWeightsRV(RandomVariable):
         alpha = at.as_tensor_variable(alpha)
         K = at.as_tensor_variable(intX(K))
 
-        if alpha.ndim > 0:
-            raise ValueError("The concentration parameter needs to be a scalar.")
-
         if K.ndim > 0:
             raise ValueError("K must be a scalar.")
 
         return super().make_node(rng, size, dtype, alpha, K)
 
-    def _infer_shape(self, size, dist_params, param_shapes=None):
-        alpha, K = dist_params
-
-        size = tuple(size)
-
-        return size + (K + 1,)
+    def _supp_shape_from_params(self, dist_params, **kwargs):
+        K = dist_params[1]
+        return (K + 1,)
 
     @classmethod
     def rng_fn(cls, rng, alpha, K, size):
         if K < 0:
             raise ValueError("K needs to be positive.")
 
-        if size is None:
-            size = (K,)
-        elif isinstance(size, int):
-            size = (size,) + (K,)
-        else:
-            size = tuple(size) + (K,)
+        size = to_tuple(size) if size is not None else alpha.shape
+        size = size + (K,)
+        alpha = alpha[..., np.newaxis]
 
         betas = rng.beta(1, alpha, size=size)
 
@@ -2267,9 +2292,9 @@ class StickBreakingWeights(SimplexContinuous):
 
     Parameters
     ----------
-    alpha: float
+    alpha : tensor_like of float
         Concentration parameter (alpha > 0).
-    K: int
+    K : tensor_like of int
         The number of "sticks" to break off from an initial one-unit stick. The length of the weight
         vector is K + 1, where the last weight is one minus the sum of all the first sticks.
 
@@ -2288,15 +2313,13 @@ class StickBreakingWeights(SimplexContinuous):
         alpha = at.as_tensor_variable(floatX(alpha))
         K = at.as_tensor_variable(intX(K))
 
-        assert_negative_support(alpha, "alpha", "StickBreakingWeights")
-        assert_negative_support(K, "K", "StickBreakingWeights")
-
         return super().dist([alpha, K], **kwargs)
 
     def moment(rv, size, alpha, K):
+        alpha = alpha[..., np.newaxis]
         moment = (alpha / (1 + alpha)) ** at.arange(K)
         moment *= 1 / (1 + alpha)
-        moment = at.concatenate([moment, [(alpha / (1 + alpha)) ** K]], axis=-1)
+        moment = at.concatenate([moment, (alpha / (1 + alpha)) ** K], axis=-1)
         if not rv_size_is_none(size):
             moment_size = at.concatenate(
                 [

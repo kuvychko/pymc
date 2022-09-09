@@ -26,8 +26,7 @@ import pymc.distributions.transforms as tr
 from pymc.aesaraf import floatX, jacobian
 from pymc.distributions import joint_logp
 from pymc.tests.checks import close_to, close_to_logical
-from pymc.tests.helpers import SeededTest
-from pymc.tests.test_distributions import (
+from pymc.tests.distributions.util import (
     Circ,
     MultiSimplex,
     R,
@@ -39,6 +38,7 @@ from pymc.tests.test_distributions import (
     UnitSortedVector,
     Vector,
 )
+from pymc.tests.helpers import SeededTest
 
 # some transforms (stick breaking) require additon of small slack in order to be numerically
 # stable. The minimal addable slack for float32 is higher thus we need to be less strict
@@ -100,7 +100,7 @@ def check_jacobian_det(
     if not elemwise:
         jac = at.log(at.nlinalg.det(jacobian(x, [y])))
     else:
-        jac = at.log(at.abs_(at.diag(jacobian(x, [y]))))
+        jac = at.log(at.abs(at.diag(jacobian(x, [y]))))
 
     # ljd = log jacobian det
     actual_ljd = aesara.function([y], jac)
@@ -557,3 +557,10 @@ def test_interval_transform_raises():
         tr.Interval(at.constant(5) + 1, None)
 
     assert tr.Interval(at.constant(5), None)
+
+
+def test_discrete_trafo():
+    with pm.Model():
+        with pytest.raises(ValueError) as err:
+            pm.Binomial("a", n=5, p=0.5, transform="log")
+        err.match("Transformations for discrete distributions")

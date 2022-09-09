@@ -32,12 +32,11 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sps
 
-from aeppl.abstract import MeasurableVariable
 from aeppl.logprob import CheckParameterValue
-from aesara import config, scalar
+from aesara import scalar
 from aesara.compile.mode import Mode, get_mode
 from aesara.gradient import grad
-from aesara.graph import local_optimizer
+from aesara.graph import node_rewriter
 from aesara.graph.basic import (
     Apply,
     Constant,
@@ -48,7 +47,7 @@ from aesara.graph.basic import (
     walk,
 )
 from aesara.graph.fg import FunctionGraph
-from aesara.graph.op import Op, compute_test_value
+from aesara.graph.op import Op
 from aesara.sandbox.rng_mrg import MRG_RandomStream as RandomStream
 from aesara.scalar.basic import Cast
 from aesara.tensor.basic import _as_tensor_variable
@@ -58,12 +57,10 @@ from aesara.tensor.random.var import (
     RandomGeneratorSharedVariable,
     RandomStateSharedVariable,
 )
-from aesara.tensor.shape import SpecifyShape
 from aesara.tensor.sharedvar import SharedVariable
 from aesara.tensor.subtensor import AdvancedIncSubtensor, AdvancedIncSubtensor1
 from aesara.tensor.var import TensorConstant, TensorVariable
 
-from pymc.exceptions import ShapeError
 from pymc.vartypes import continuous_types, isgenerator, typefilter
 
 PotentialShapeType = Union[int, np.ndarray, Sequence[Union[int, Variable]], TensorVariable]
@@ -148,65 +145,6 @@ def convert_observed_data(data):
 @_as_tensor_variable.register(pd.DataFrame)
 def dataframe_to_tensor_variable(df: pd.DataFrame, *args, **kwargs) -> TensorVariable:
     return at.as_tensor_variable(df.to_numpy(), *args, **kwargs)
-
-
-def change_rv_size(
-    rv: TensorVariable,
-    new_size: PotentialShapeType,
-    expand: Optional[bool] = False,
-) -> TensorVariable:
-    """Change or expand the size of a `RandomVariable`.
-
-    Parameters
-    ==========
-    rv
-        The old `RandomVariable` output.
-    new_size
-        The new size.
-    expand:
-        Expand the existing size by `new_size`.
-
-    """
-    # Check the dimensionality of the `new_size` kwarg
-    new_size_ndim = np.ndim(new_size)
-    if new_size_ndim > 1:
-        raise ShapeError("The `new_size` must be ≤1-dimensional.", actual=new_size_ndim)
-    elif new_size_ndim == 0:
-        new_size = (new_size,)
-
-    # Extract the RV node that is to be resized, together with its inputs, name and tag
-    assert rv.owner.op is not None
-    if isinstance(rv.owner.op, SpecifyShape):
-        rv = rv.owner.inputs[0]
-    rv_node = rv.owner
-    rng, size, dtype, *dist_params = rv_node.inputs
-    name = rv.name
-    tag = rv.tag
-
-    if expand:
-        shape = tuple(rv_node.op._infer_shape(size, dist_params))
-        size = shape[: len(shape) - rv_node.op.ndim_supp]
-        new_size = tuple(new_size) + tuple(size)
-
-    # Make sure the new size is a tensor. This dtype-aware conversion helps
-    # to not unnecessarily pick up a `Cast` in some cases (see #4652).
-    new_size = at.as_tensor(new_size, ndim=1, dtype="int64")
-
-    new_rv_node = rv_node.op.make_node(rng, new_size, dtype, *dist_params)
-    new_rv = new_rv_node.outputs[-1]
-    new_rv.name = name
-    for k, v in tag.__dict__.items():
-        new_rv.tag.__dict__.setdefault(k, v)
-
-    # Update "traditional" rng default_update, if that was set for old RV
-    default_update = getattr(rng, "default_update", None)
-    if default_update is not None and default_update is rv_node.outputs[0]:
-        rng.default_update = new_rv_node.outputs[0]
-
-    if config.compute_test_value != "off":
-        compute_test_value(new_rv_node)
-
-    return new_rv
 
 
 def extract_rv_and_value_vars(
@@ -619,7 +557,7 @@ def make_shared_replacements(point, vars, model):
     """
     othervars = set(model.value_vars) - set(vars)
     return {
-        var: aesara.shared(point[var.name], var.name + "_shared", broadcastable=var.broadcastable)
+        var: aesara.shared(point[var.name], var.name + "_shared", shape=var.broadcastable)
         for var in othervars
     }
 
@@ -875,7 +813,7 @@ def largest_common_dtype(tensors):
     return np.stack([np.ones((), dtype=dtype) for dtype in dtypes]).dtype
 
 
-@local_optimizer(tracks=[CheckParameterValue])
+@node_rewriter(tracks=[CheckParameterValue])
 def local_remove_check_parameter(fgraph, node):
     """Rewrite that removes Aeppl's CheckParameterValue
 
@@ -885,7 +823,7 @@ def local_remove_check_parameter(fgraph, node):
         return [node.inputs[0]]
 
 
-@local_optimizer(tracks=[CheckParameterValue])
+@node_rewriter(tracks=[CheckParameterValue])
 def local_check_parameter_to_ninf_switch(fgraph, node):
     if isinstance(node.op, CheckParameterValue):
         logp_expr, *logp_conds = node.inputs
@@ -924,6 +862,31 @@ def find_rng_nodes(
         for node in graph_inputs(variables)
         if isinstance(node, (RandomStateSharedVariable, RandomGeneratorSharedVariable))
     ]
+
+
+def replace_rng_nodes(outputs: Sequence[TensorVariable]) -> Sequence[TensorVariable]:
+    """Replace any RNG nodes upsteram of outputs by new RNGs of the same type
+
+    This can be used when combining a pre-existing graph with a cloned one, to ensure
+    RNGs are unique across the two graphs.
+    """
+    rng_nodes = find_rng_nodes(outputs)
+
+    # Nothing to do here
+    if not rng_nodes:
+        return outputs
+
+    graph = FunctionGraph(outputs=outputs, clone=False)
+    new_rng_nodes: List[Union[np.random.RandomState, np.random.Generator]] = []
+    for rng_node in rng_nodes:
+        rng_cls: type
+        if isinstance(rng_node, at.random.var.RandomStateSharedVariable):
+            rng_cls = np.random.RandomState
+        else:
+            rng_cls = np.random.Generator
+        new_rng_nodes.append(aesara.shared(rng_cls(np.random.PCG64())))
+    graph.replace_all(zip(rng_nodes, new_rng_nodes), import_missing=True)
+    return graph.outputs
 
 
 SeedSequenceSeed = Optional[Union[int, Sequence[int], np.ndarray, np.random.SeedSequence]]
@@ -987,6 +950,9 @@ def compile_pymc(
         this function is called within a model context and the model `check_bounds` flag
         is set to False.
     """
+    # Avoid circular import
+    from pymc.distributions.distribution import SymbolicRandomVariable
+
     # Create an update mapping of RandomVariable's RNG so that it is automatically
     # updated after every function call
     rng_updates = {}
@@ -995,7 +961,7 @@ def compile_pymc(
         var
         for var in vars_between(inputs, output_to_list)
         if var.owner
-        and isinstance(var.owner.op, (RandomVariable, MeasurableVariable))
+        and isinstance(var.owner.op, (RandomVariable, SymbolicRandomVariable))
         and var not in inputs
     ):
         # All nodes in `vars_between(inputs, outputs)` have owners.
@@ -1003,14 +969,21 @@ def compile_pymc(
         assert random_var.owner.op is not None
         if isinstance(random_var.owner.op, RandomVariable):
             rng = random_var.owner.inputs[0]
-            if not hasattr(rng, "default_update"):
-                rng_updates[rng] = random_var.owner.outputs[0]
+            if hasattr(rng, "default_update"):
+                update_map = {rng: rng.default_update}
             else:
-                rng_updates[rng] = rng.default_update
+                update_map = {rng: random_var.owner.outputs[0]}
         else:
-            update_fn = getattr(random_var.owner.op, "update", None)
-            if update_fn is not None:
-                rng_updates.update(update_fn(random_var.owner))
+            update_map = random_var.owner.op.update(random_var.owner)
+        # Check that we are not setting different update expressions for the same variables
+        for rng, update in update_map.items():
+            if rng not in rng_updates:
+                rng_updates[rng] = update
+            # When a variable has multiple outputs, it will be called twice with the same
+            # update expression. We don't want to raise in that case, only if the update
+            # expression in different from the one already registered
+            elif rng_updates[rng] is not update:
+                raise ValueError(f"Multiple update expressions found for the variable {rng}")
 
     # We always reseed random variables as this provides RNGs with no chances of collision
     if rng_updates:

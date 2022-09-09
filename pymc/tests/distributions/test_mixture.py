@@ -12,6 +12,8 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
+import warnings
+
 from contextlib import ExitStack as does_not_raise
 
 import aesara
@@ -49,7 +51,7 @@ from pymc.distributions import (
 )
 from pymc.distributions.logprob import logp
 from pymc.distributions.mixture import MixtureTransformWarning
-from pymc.distributions.shape_utils import to_tuple
+from pymc.distributions.shape_utils import change_dist_size, to_tuple
 from pymc.distributions.transforms import _default_transform
 from pymc.math import expand_packed_triangular
 from pymc.model import Model
@@ -60,10 +62,13 @@ from pymc.sampling import (
     sample_prior_predictive,
 )
 from pymc.step_methods import Metropolis
+from pymc.tests.distributions.util import (
+    Domain,
+    Simplex,
+    assert_moment_is_expected,
+    pymc_random,
+)
 from pymc.tests.helpers import SeededTest
-from pymc.tests.test_distributions import Domain, Simplex
-from pymc.tests.test_distributions_moments import assert_moment_is_expected
-from pymc.tests.test_distributions_random import pymc_random
 
 
 def generate_normal_mixture_data(w, mu, sigma, size=1000):
@@ -335,9 +340,9 @@ class TestMixture(SeededTest):
     @pytest.mark.parametrize(
         "comp_dists",
         (
-            [Normal.dist(size=(2,))],
+            Normal.dist(size=(2,)),
             [Normal.dist(), Normal.dist()],
-            [MvNormal.dist(np.ones(3), np.eye(3), size=(2,))],
+            MvNormal.dist(np.ones(3), np.eye(3), size=(2,)),
             [
                 MvNormal.dist(np.ones(3), np.eye(3)),
                 MvNormal.dist(np.ones(3), np.eye(3)),
@@ -346,7 +351,10 @@ class TestMixture(SeededTest):
     )
     def test_components_expanded_by_weights(self, comp_dists):
         """Test that components are expanded when size or weights are larger than components"""
-        univariate = comp_dists[0].owner.op.ndim_supp == 0
+        if isinstance(comp_dists, list):
+            univariate = comp_dists[0].owner.op.ndim_supp == 0
+        else:
+            univariate = comp_dists.owner.op.ndim_supp == 0
 
         mix = Mixture.dist(
             w=Dirichlet.dist([1, 1], shape=(3, 2)),
@@ -369,9 +377,9 @@ class TestMixture(SeededTest):
     @pytest.mark.parametrize(
         "comp_dists",
         (
-            [Normal.dist(size=(2,))],
+            Normal.dist(size=(2,)),
             [Normal.dist(), Normal.dist()],
-            [MvNormal.dist(np.ones(3), np.eye(3), size=(2,))],
+            MvNormal.dist(np.ones(3), np.eye(3), size=(2,)),
             [
                 MvNormal.dist(np.ones(3), np.eye(3)),
                 MvNormal.dist(np.ones(3), np.eye(3)),
@@ -379,18 +387,21 @@ class TestMixture(SeededTest):
         ),
     )
     @pytest.mark.parametrize("expand", (False, True))
-    def test_change_size(self, comp_dists, expand):
-        univariate = comp_dists[0].owner.op.ndim_supp == 0
+    def test_change_dist_size(self, comp_dists, expand):
+        if isinstance(comp_dists, list):
+            univariate = comp_dists[0].owner.op.ndim_supp == 0
+        else:
+            univariate = comp_dists.owner.op.ndim_supp == 0
 
         mix = Mixture.dist(w=Dirichlet.dist([1, 1]), comp_dists=comp_dists)
-        mix = Mixture.change_size(mix, new_size=(4,), expand=expand)
+        mix = change_dist_size(mix, new_size=(4,), expand=expand)
         draws = mix.eval()
         expected_shape = (4,) if univariate else (4, 3)
         assert draws.shape == expected_shape
         assert np.unique(draws).size == draws.size
 
         mix = Mixture.dist(w=Dirichlet.dist([1, 1]), comp_dists=comp_dists, size=(3,))
-        mix = Mixture.change_size(mix, new_size=(5, 4), expand=expand)
+        mix = change_dist_size(mix, new_size=(5, 4), expand=expand)
         draws = mix.eval()
         expected_shape = (5, 4) if univariate else (5, 4, 3)
         if expand:
@@ -440,14 +451,17 @@ class TestMixture(SeededTest):
             mu = Gamma("mu", 1.0, 1.0, shape=pois_w.size)
             Mixture("x_obs", w, Poisson.dist(mu), observed=pois_x)
             step = Metropolis()
-            trace = sample(
-                5000,
-                step,
-                random_seed=self.random_seed,
-                progressbar=False,
-                chains=1,
-                return_inferencedata=False,
-            )
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", "More chains .* than draws.*", UserWarning)
+                warnings.filterwarnings("ignore", "overflow encountered in exp", RuntimeWarning)
+                trace = sample(
+                    5000,
+                    step,
+                    random_seed=self.random_seed,
+                    progressbar=False,
+                    chains=1,
+                    return_inferencedata=False,
+                )
 
         assert_allclose(np.sort(trace["w"].mean(axis=0)), np.sort(pois_w), rtol=0.1, atol=0.1)
         assert_allclose(np.sort(trace["mu"].mean(axis=0)), np.sort(pois_mu), rtol=0.1, atol=0.1)
@@ -461,14 +475,17 @@ class TestMixture(SeededTest):
             w = Dirichlet("w", floatX(np.ones_like(pois_w)), shape=pois_w.shape)
             mu = Gamma("mu", 1.0, 1.0, shape=pois_w.size)
             Mixture("x_obs", w, [Poisson.dist(mu[0]), Poisson.dist(mu[1])], observed=pois_x)
-            trace = sample(
-                5000,
-                chains=1,
-                step=Metropolis(),
-                random_seed=self.random_seed,
-                progressbar=False,
-                return_inferencedata=False,
-            )
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", "More chains .* than draws.*", UserWarning)
+                warnings.filterwarnings("ignore", "overflow encountered in exp", RuntimeWarning)
+                trace = sample(
+                    5000,
+                    chains=1,
+                    step=Metropolis(),
+                    random_seed=self.random_seed,
+                    progressbar=False,
+                    return_inferencedata=False,
+                )
 
         assert_allclose(np.sort(trace["w"].mean(axis=0)), np.sort(pois_w), rtol=0.1, atol=0.1)
         assert_allclose(np.sort(trace["mu"].mean(axis=0)), np.sort(pois_mu), rtol=0.1, atol=0.1)
@@ -489,14 +506,17 @@ class TestMixture(SeededTest):
                 [Normal.dist(mu[0], tau=tau[0]), Normal.dist(mu[1], tau=tau[1])],
                 observed=norm_x,
             )
-            trace = sample(
-                5000,
-                chains=1,
-                step=Metropolis(),
-                random_seed=self.random_seed,
-                progressbar=False,
-                return_inferencedata=False,
-            )
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", "More chains .* than draws.*", UserWarning)
+                warnings.filterwarnings("ignore", "overflow encountered in exp", RuntimeWarning)
+                trace = sample(
+                    5000,
+                    chains=1,
+                    step=Metropolis(),
+                    random_seed=self.random_seed,
+                    progressbar=False,
+                    return_inferencedata=False,
+                )
 
         assert_allclose(np.sort(trace["w"].mean(axis=0)), np.sort(norm_w), rtol=0.1, atol=0.1)
         assert_allclose(np.sort(trace["mu"].mean(axis=0)), np.sort(norm_mu), rtol=0.1, atol=0.1)
@@ -579,13 +599,17 @@ class TestMixture(SeededTest):
         assert prior["mu0"].shape == (n_samples, D)
         assert prior["chol_cov_0"].shape == (n_samples, D * (D + 1) // 2)
 
-    @pytest.mark.xfail(reason="Nested mixtures not refactored yet")
     def test_nested_mixture(self):
         if aesara.config.floatX == "float32":
             rtol = 1e-4
         else:
             rtol = 1e-7
         nbr = 4
+
+        norm_x = generate_normal_mixture_data(
+            np.r_[0.75, 0.25], np.r_[0.0, 5.0], np.r_[1.0, 1.0], size=1000
+        )
+
         with Model() as model:
             # mixtures components
             g_comp = Normal.dist(
@@ -602,7 +626,7 @@ class TestMixture(SeededTest):
             l_mix = Mixture.dist(w=l_w, comp_dists=l_comp)
             # mixture of mixtures
             mix_w = Dirichlet("mix_w", a=floatX(np.ones(2)), transform=None, shape=(2,))
-            mix = Mixture("mix", w=mix_w, comp_dists=[g_mix, l_mix], observed=np.exp(self.norm_x))
+            mix = Mixture("mix", w=mix_w, comp_dists=[g_mix, l_mix], observed=np.exp(norm_x))
 
         test_point = model.initial_point()
 
@@ -638,27 +662,29 @@ class TestMixture(SeededTest):
             )
             return priorlogp, mixmixlogpg
 
-        value = np.exp(self.norm_x)[:, None]
+        value = np.exp(norm_x)[:, None]
         priorlogp, mixmixlogpg = mixmixlogp(value, test_point)
 
         # check logp of mixture
-        assert_allclose(mixmixlogpg, mix.logp_elemwise(test_point), rtol=rtol)
+        mix_logp_fn = model.compile_logp(vars=[mix], sum=False)
+        assert_allclose(mixmixlogpg, mix_logp_fn(test_point)[0], rtol=rtol)
 
         # check model logp
-        assert_allclose(priorlogp + mixmixlogpg.sum(), model.logp(test_point), rtol=rtol)
+        model_logp_fn = model.compile_logp()
+        assert_allclose(priorlogp + mixmixlogpg.sum(), model_logp_fn(test_point), rtol=rtol)
 
         # check input and check logp again
         test_point["g_w"] = np.asarray([0.1, 0.1, 0.2, 0.6])
         test_point["mu_g"] = np.exp(np.random.randn(nbr))
         priorlogp, mixmixlogpg = mixmixlogp(value, test_point)
-        assert_allclose(mixmixlogpg, mix.logp_elemwise(test_point), rtol=rtol)
-        assert_allclose(priorlogp + mixmixlogpg.sum(), model.logp(test_point), rtol=rtol)
+        assert_allclose(mixmixlogpg, mix_logp_fn(test_point)[0], rtol=rtol)
+        assert_allclose(priorlogp + mixmixlogpg.sum(), model_logp_fn(test_point), rtol=rtol)
 
     def test_iterable_single_component_warning(self):
-        with pytest.warns(None) as record:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
             Mixture.dist(w=[0.5, 0.5], comp_dists=Normal.dist(size=2))
             Mixture.dist(w=[0.5, 0.5], comp_dists=[Normal.dist(size=2), Normal.dist(size=2)])
-        assert not record
 
         with pytest.warns(UserWarning, match="Single component will be treated as a mixture"):
             Mixture.dist(w=[0.5, 0.5], comp_dists=[Normal.dist(size=2)])
@@ -745,14 +771,17 @@ class TestNormalMixture(SeededTest):
             tau = Gamma("tau", 1.0, 1.0, shape=norm_w.size)
             NormalMixture("x_obs", w, mu, tau=tau, observed=norm_x)
             step = Metropolis()
-            trace = sample(
-                5000,
-                step,
-                random_seed=self.random_seed,
-                progressbar=False,
-                chains=1,
-                return_inferencedata=False,
-            )
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", "More chains .* than draws.*", UserWarning)
+                warnings.filterwarnings("ignore", "overflow encountered in exp", RuntimeWarning)
+                trace = sample(
+                    5000,
+                    step,
+                    random_seed=self.random_seed,
+                    progressbar=False,
+                    chains=1,
+                    return_inferencedata=False,
+                )
 
         assert_allclose(np.sort(trace["w"].mean(axis=0)), np.sort(norm_w), rtol=0.1, atol=0.1)
         assert_allclose(np.sort(trace["mu"].mean(axis=0)), np.sort(norm_mu), rtol=0.1, atol=0.1)
@@ -824,7 +853,6 @@ class TestNormalMixture(SeededTest):
             extra_args={"comp_shape": 2},
             size=1000,
             ref_rand=ref_rand,
-            change_rv_size_fn=Mixture.change_size,
         )
         pymc_random(
             NormalMixture,
@@ -836,7 +864,6 @@ class TestNormalMixture(SeededTest):
             extra_args={"comp_shape": 3},
             size=1000,
             ref_rand=ref_rand,
-            change_rv_size_fn=Mixture.change_size,
         )
 
 
@@ -979,7 +1006,8 @@ class TestMixtureSameFamily(SeededTest):
         w = np.ones(self.mixture_comps) / self.mixture_comps
         mixture_axis = len(batch_shape)
         with Model() as model:
-            comp_dists = Multinomial.dist(p=p, n=n, shape=(*batch_shape, self.mixture_comps, 3))
+            with pytest.warns(UserWarning, match="parameters sum up to"):
+                comp_dists = Multinomial.dist(p=p, n=n, shape=(*batch_shape, self.mixture_comps, 3))
             mixture = Mixture(
                 "mixture",
                 w=w,
@@ -1303,9 +1331,9 @@ class TestMixtureDefaultTransforms:
     def test_warning(self):
         with Model() as m:
             comp_dists = [HalfNormal.dist(), Exponential.dist(1)]
-            with pytest.warns(None) as rec:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
                 Mixture("mix1", w=[0.5, 0.5], comp_dists=comp_dists)
-            assert not rec
 
             comp_dists = [Uniform.dist(0, 1), Uniform.dist(0, 2)]
             with pytest.warns(MixtureTransformWarning):
@@ -1315,16 +1343,16 @@ class TestMixtureDefaultTransforms:
             with pytest.warns(MixtureTransformWarning):
                 Mixture("mix3", w=[0.5, 0.5], comp_dists=comp_dists)
 
-            with pytest.warns(None) as rec:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
                 Mixture("mix4", w=[0.5, 0.5], comp_dists=comp_dists, transform=None)
-            assert not rec
 
-            with pytest.warns(None) as rec:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
                 Mixture("mix5", w=[0.5, 0.5], comp_dists=comp_dists, observed=1)
-            assert not rec
 
             # Case where the appropriate default transform is None
             comp_dists = [Normal.dist(), Normal.dist()]
-            with pytest.warns(None) as rec:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
                 Mixture("mix6", w=[0.5, 0.5], comp_dists=comp_dists)
-            assert not rec
